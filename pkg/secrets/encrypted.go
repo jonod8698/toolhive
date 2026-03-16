@@ -54,6 +54,9 @@ func (e *EncryptedManager) SetSecret(_ context.Context, name, value string) erro
 	}
 
 	return fileutils.WithFileLock(e.filePath, func() error {
+		if err := e.reloadFromFile(); err != nil {
+			return fmt.Errorf("failed to reload secrets: %w", err)
+		}
 		e.secrets.Store(name, value)
 		return e.updateFile()
 	})
@@ -65,13 +68,14 @@ func (e *EncryptedManager) DeleteSecret(_ context.Context, name string) error {
 		return errors.New("secret name cannot be empty")
 	}
 
-	// Check if the secret exists first
-	_, ok := e.secrets.Load(name)
-	if !ok {
-		return fmt.Errorf("cannot delete non-existent secret: %s", name)
-	}
-
 	return fileutils.WithFileLock(e.filePath, func() error {
+		if err := e.reloadFromFile(); err != nil {
+			return fmt.Errorf("failed to reload secrets: %w", err)
+		}
+		_, ok := e.secrets.Load(name)
+		if !ok {
+			return fmt.Errorf("cannot delete non-existent secret: %s", name)
+		}
 		e.secrets.Delete(name)
 		return e.updateFile()
 	})
@@ -92,10 +96,12 @@ func (e *EncryptedManager) ListSecrets(_ context.Context) ([]SecretDescription, 
 // Cleanup removes all secrets managed by this manager.
 func (e *EncryptedManager) Cleanup() error {
 	return fileutils.WithFileLock(e.filePath, func() error {
-		// Create a new empty syncmap.Map
+		if err := e.reloadFromFile(); err != nil {
+			return fmt.Errorf("failed to reload secrets: %w", err)
+		}
+		// Cleanup intentionally clears every secret under the lock.
 		e.secrets = syncmap.Map{}
 
-		// Update the file to reflect the empty state
 		return e.updateFile()
 	})
 }
@@ -109,6 +115,50 @@ func (*EncryptedManager) Capabilities() ProviderCapabilities {
 		CanList:    true,
 		CanCleanup: true,
 	}
+}
+
+// reloadFromFile re-reads and decrypts the secrets file from disk,
+// refreshing the in-memory map. Must be called under WithFileLock to
+// prevent the TOCTOU race where a stale in-memory map overwrites
+// concurrent changes on the next updateFile call.
+func (e *EncryptedManager) reloadFromFile() error {
+	// #nosec G304: File path is not configurable at this time.
+	data, err := os.ReadFile(e.filePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			e.secrets.Clear()
+			return nil
+		}
+		return fmt.Errorf("failed to read secrets file: %w", err)
+	}
+
+	if len(data) == 0 {
+		e.secrets.Clear()
+		return nil
+	}
+
+	decrypted, err := aes.Decrypt(data, e.key)
+	if err != nil {
+		return fmt.Errorf("failed to decrypt secrets file: %w", err)
+	}
+
+	var contents fileStructure
+	if err := json.Unmarshal(decrypted, &contents); err != nil {
+		return fmt.Errorf("failed to decode secrets file: %w", err)
+	}
+
+	diskKeys := make(map[string]struct{}, len(contents.Secrets))
+	for k, v := range contents.Secrets {
+		e.secrets.Store(k, v)
+		diskKeys[k] = struct{}{}
+	}
+	e.secrets.Range(func(key, _ interface{}) bool {
+		if _, ok := diskKeys[key.(string)]; !ok {
+			e.secrets.Delete(key)
+		}
+		return true
+	})
+	return nil
 }
 
 func (e *EncryptedManager) updateFile() error {

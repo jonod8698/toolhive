@@ -370,6 +370,86 @@ func TestEncryptedManager_Concurrency(t *testing.T) {
 	}
 }
 
+// TestEncryptedManager_TOCTOU_StaleManagerOverwrite is a regression test for
+// the TOCTOU race in SetSecret. Two managers are created from the same
+// (initially empty) backing file, simulating two separate CLI invocations
+// that each snapshot the file at construction time. Without the
+// reloadFromFile fix, the second writer's stale in-memory map silently
+// overwrites the first writer's secret on disk.
+func TestEncryptedManager_TOCTOU_StaleManagerOverwrite(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	tempFile := createTempFile(t)
+	defer os.Remove(tempFile)
+
+	key := generateRandomKey(t)
+
+	// Both managers snapshot the same empty file at construction time.
+	managerA := createEncryptedManager(t, tempFile, key)
+	managerB := createEncryptedManager(t, tempFile, key)
+
+	// A writes "alpha" → file now contains {alpha: value-a}.
+	require.NoError(t, managerA.SetSecret(ctx, "alpha", "value-a"))
+
+	// B writes "beta". Its in-memory map was empty at construction.
+	// BUG (unpatched): B writes {beta: value-b}, erasing alpha.
+	// FIX (patched):   B reloads from disk first, writes {alpha, beta}.
+	require.NoError(t, managerB.SetSecret(ctx, "beta", "value-b"))
+
+	// Ground truth: fresh manager reads the file as-is from disk.
+	verifier := createEncryptedManager(t, tempFile, key)
+
+	valA, errA := verifier.GetSecret(ctx, "alpha")
+	assert.NoError(t, errA, "secret 'alpha' must survive a write by another stale manager (TOCTOU)")
+	assert.Equal(t, "value-a", valA)
+
+	valB, errB := verifier.GetSecret(ctx, "beta")
+	assert.NoError(t, errB, "secret 'beta' must be present")
+	assert.Equal(t, "value-b", valB)
+}
+
+// TestEncryptedManager_TOCTOU_SequentialCLI simulates N sequential
+// "thv secret set" invocations, each of which creates a fresh
+// EncryptedManager from the same backing file before any other instance
+// has written. Without the reloadFromFile fix, only the last secret
+// survives because every write clobbers all prior secrets.
+func TestEncryptedManager_TOCTOU_SequentialCLI(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	tempFile := createTempFile(t)
+	defer os.Remove(tempFile)
+
+	key := generateRandomKey(t)
+	const numSecrets = 10
+
+	// Pre-create all managers from the same (empty) file, mimicking N
+	// CLI processes that all start before any of them have written.
+	managers := make([]*EncryptedManager, numSecrets)
+	for i := range managers {
+		managers[i] = createEncryptedManager(t, tempFile, key)
+	}
+
+	for i, m := range managers {
+		require.NoError(t,
+			m.SetSecret(ctx, fmt.Sprintf("secret-%d", i), fmt.Sprintf("value-%d", i)),
+			"SetSecret for secret-%d should succeed", i)
+	}
+
+	verifier := createEncryptedManager(t, tempFile, key)
+	secrets, err := verifier.ListSecrets(ctx)
+	require.NoError(t, err)
+
+	assert.Len(t, secrets, numSecrets,
+		"all %d secrets must survive; TOCTOU bug causes only the last one to persist", numSecrets)
+
+	for i := 0; i < numSecrets; i++ {
+		name := fmt.Sprintf("secret-%d", i)
+		got, err := verifier.GetSecret(ctx, name)
+		assert.NoError(t, err, "%s must exist on disk", name)
+		assert.Equal(t, fmt.Sprintf("value-%d", i), got, "%s must have correct value", name)
+	}
+}
+
 // End of tests
 
 // Helper functions
